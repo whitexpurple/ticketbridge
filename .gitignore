@@ -1,0 +1,38 @@
+# Local credentials and session tokens
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Python environments and generated caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Runtime ticket data and logs
+/data/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+
+# Build output
+build/
+dist/
+*.egg-info/
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,7 @@
+# === FILE: C:\Users\DELL\Documents\projects\ticketbridge\requirements.txt ===
+# install using - pip install -r requirements.txt
+
+websockets>=14.0
+python-telegram-bot>=20.0
+python-dotenv>=1.0.0
+httpx>=0.27.0
