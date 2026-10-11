@@ -117,7 +117,8 @@ def init_db():
 
         if "closed_at" not in ticket_columns:
             cursor.execute("ALTER TABLE tickets ADD COLUMN closed_at TEXT")
-
+        if "account_id" not in ticket_columns:
+            cursor.execute("ALTER TABLE tickets ADD COLUMN account_id TEXT")
         cursor.executescript("""
             CREATE TABLE IF NOT EXISTS monitor_state (
                 account_id TEXT PRIMARY KEY, started_at_ms INTEGER NOT NULL
@@ -180,6 +181,13 @@ def init_db():
             );
         """)
 
+        conn.execute("""UPDATE tickets SET account_id=(
+            SELECT tracked_channels.account_id FROM tracked_channels
+            WHERE tracked_channels.channel_id=tickets.channel_id LIMIT 1
+        ) WHERE account_id IS NULL AND EXISTS (
+            SELECT 1 FROM tracked_channels WHERE tracked_channels.channel_id=tickets.channel_id
+        )""")
+
         discovery_columns = {row[1] for row in conn.execute("PRAGMA table_info(discovery_checks)")}
         if "channels_error" not in discovery_columns:
             conn.execute("ALTER TABLE discovery_checks ADD COLUMN channels_error TEXT")
@@ -189,6 +197,16 @@ def init_db():
         outbox_columns = {row[1] for row in conn.execute("PRAGMA table_info(notification_outbox)")}
         if "entities" not in outbox_columns:
             conn.execute("ALTER TABLE notification_outbox ADD COLUMN entities TEXT")
+
+        report_columns = {row[1] for row in conn.execute("PRAGMA table_info(daily_reports)")}
+        if "account_id" not in report_columns:
+            conn.execute("ALTER TABLE daily_reports RENAME TO daily_reports_legacy")
+            conn.execute("""CREATE TABLE daily_reports (
+                report_date TEXT NOT NULL, account_id TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL,
+                PRIMARY KEY(report_date, account_id))""")
+            conn.execute("INSERT OR IGNORE INTO daily_reports(report_date,account_id,created_at) "
+                         "SELECT report_date,'',created_at FROM daily_reports_legacy")
+            conn.execute("DROP TABLE daily_reports_legacy")
 
         conn.commit()
 

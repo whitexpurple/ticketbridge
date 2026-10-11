@@ -127,6 +127,7 @@ class TicketDiscovery:
         self.discovery_check_failures = 0
         self.idle_cycles = 0
         self.activity = 0
+        self.wake = asyncio.Event()
         self.recovery_cursor = {}
         self.inaccessible_endpoints = {}
         if self.account_id:
@@ -155,7 +156,8 @@ class TicketDiscovery:
                     conn.execute("INSERT OR IGNORE INTO discovery_scan_state(account_id,last_guild_id) VALUES (?,NULL)",
                                  (self.account_id,))
                 self.tracked = {row[0] for row in conn.execute("""SELECT tracked_channels.channel_id
-                    FROM tracked_channels JOIN tickets USING(channel_id) WHERE account_id=? AND active=1""", (self.account_id,))}
+                    FROM tracked_channels JOIN tickets USING(channel_id)
+                    WHERE tracked_channels.account_id=? AND tickets.active=1""", (self.account_id,))}
                 now = time.time()
                 self.inaccessible_endpoints = {
                     (str(guild_id), endpoint): inaccessible_until
@@ -266,7 +268,8 @@ class TicketDiscovery:
         conn = get_connection()
         try:
             return [row[0] for row in conn.execute("""SELECT tracked_channels.channel_id
-                FROM tracked_channels JOIN tickets USING(channel_id) WHERE account_id=? AND active=1
+                FROM tracked_channels JOIN tickets USING(channel_id)
+                WHERE tracked_channels.account_id=? AND tickets.active=1
                 ORDER BY tracked_channels.channel_id""", (self.account_id,))]
         finally:
             conn.close()
@@ -315,6 +318,9 @@ class TicketDiscovery:
                     self.tracked.add(channel_id)
 
     async def channel_created(self, channel):
+        if (self.is_live_channel(channel.get("id")) and channel.get("guild_id")
+                and channel.get("type") in (0, 10, 11, 12)):
+            self.wake.set()
         await self.consider(channel)
         if self.is_live_channel(channel.get("id")) and channel.get("type") in (0, 10, 11, 12):
             if channel.get("guild_id"):
@@ -606,6 +612,7 @@ class TicketDiscovery:
         logger.info("Live-only ticket discovery active across %d servers; pre-existing tickets are ignored.",
                     len(self.client.guilds_list))
         while True:
+            self.wake.clear()
             previous_activity = self.activity
             actionable_failures = self.rest_actionable_failures
             discovery_failures = self.discovery_check_failures
@@ -636,4 +643,7 @@ class TicketDiscovery:
                 self.scan_running = False
                 self.scan_started_at = None
             self.idle_cycles = self.idle_cycles + 1 if self.activity == previous_activity else 0
-            await asyncio.sleep(self.scan_delay())
+            try:
+                await asyncio.wait_for(self.wake.wait(), timeout=self.scan_delay())
+            except asyncio.TimeoutError:
+                pass

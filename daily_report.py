@@ -65,7 +65,7 @@ def compose_report(report_day, timezone_name, rows, guild_names, title="TicketBr
 
 
 class DailyReportWorker:
-    def __init__(self, outbox, timezone_name="Etc/GMT-1", guilds_provider=None):
+    def __init__(self, outbox, timezone_name="Etc/GMT-1", guilds_provider=None, accounts_provider=None):
         self.outbox = outbox
         try:
             self.zone = ZoneInfo(timezone_name)
@@ -73,6 +73,7 @@ class DailyReportWorker:
             raise ValueError(f"Unknown DAILY_REPORT_TIMEZONE: {timezone_name}") from error
         self.timezone_name = timezone_name
         self.guilds_provider = guilds_provider or (lambda: {})
+        self.accounts_provider = accounts_provider
 
     def _guild_names(self):
         names = {}
@@ -90,19 +91,33 @@ class DailyReportWorker:
             conn.close()
         return names
 
-    def _report_text(self, report_day):
+    def _report_text(self, report_day, account_id=None, account_name=None):
         conn = get_connection()
         try:
-            rows = conn.execute("SELECT guild_id,opened_at,closed_at,active FROM tickets").fetchall()
+            if account_id is None:
+                rows = conn.execute("SELECT guild_id,opened_at,closed_at,active FROM tickets WHERE account_id IS NULL").fetchall()
+            else:
+                rows = conn.execute("SELECT guild_id,opened_at,closed_at,active FROM tickets WHERE account_id=?",
+                                    (str(account_id),)).fetchall()
         finally:
             conn.close()
-        return compose_report(report_day, self.timezone_name, rows, self._guild_names())
+        title = f"TicketBridge Daily Report · {account_name}" if account_name else "TicketBridge Daily Report"
+        return compose_report(report_day, self.timezone_name, rows, self._guild_names(), title)
 
     def current_report(self):
         today = datetime.now(self.zone).date()
         conn = get_connection()
         try:
-            rows = conn.execute("SELECT guild_id,opened_at,closed_at,active FROM tickets").fetchall()
+            accounts = self.accounts_provider() if self.accounts_provider else []
+            if accounts:
+                reports = []
+                for account in accounts:
+                    rows = conn.execute("SELECT guild_id,opened_at,closed_at,active FROM tickets WHERE account_id=?",
+                                        (str(account["id"]),)).fetchall()
+                    reports.append(compose_report(today, self.timezone_name, rows, self._guild_names(),
+                                                  f"TicketBridge Daily Report (so far) · {account['username']}"))
+                return "\n\n".join(reports)
+            rows = conn.execute("SELECT guild_id,opened_at,closed_at,active FROM tickets WHERE account_id IS NULL").fetchall()
         finally:
             conn.close()
         return compose_report(today, self.timezone_name, rows, self._guild_names(),
@@ -129,20 +144,31 @@ class DailyReportWorker:
         next_day = date.fromisoformat(latest) + timedelta(days=1)
 
         published = 0
+        accounts = self.accounts_provider() if self.accounts_provider else []
+        if not accounts:
+            accounts = [{"id": None, "username": None}]
         while next_day <= yesterday:
-            text = self._report_text(next_day)
+            for account in accounts:
+                account_id = str(account["id"]) if account.get("id") is not None else ""
+                text = self._report_text(next_day, account.get("id"), account.get("username"))
+                conn = get_connection()
+                try:
+                    with conn:
+                        exists = conn.execute("SELECT 1 FROM daily_reports WHERE report_date=? AND account_id=?",
+                                              (next_day.isoformat(), account_id)).fetchone()
+                        if not exists:
+                            self.outbox.insert(conn, text,
+                                               f"daily-report:{next_day.isoformat()}:{account_id or 'legacy'}")
+                            conn.execute("INSERT INTO daily_reports(report_date,account_id,created_at) VALUES (?,?,?)",
+                                         (next_day.isoformat(), account_id, time.time()))
+                            published += 1
+                finally:
+                    conn.close()
             conn = get_connection()
             try:
                 with conn:
-                    exists = conn.execute("SELECT 1 FROM daily_reports WHERE report_date=?",
-                                          (next_day.isoformat(),)).fetchone()
-                    if not exists:
-                        self.outbox.insert(conn, text, f"daily-report:{next_day.isoformat()}")
-                        conn.execute("INSERT INTO daily_reports(report_date,created_at) VALUES (?,?)",
-                                     (next_day.isoformat(), time.time()))
-                        conn.execute("UPDATE daily_report_state SET last_report_date=? WHERE state_id=1",
-                                     (next_day.isoformat(),))
-                        published += 1
+                    conn.execute("UPDATE daily_report_state SET last_report_date=? WHERE state_id=1",
+                                 (next_day.isoformat(),))
             finally:
                 conn.close()
             next_day += timedelta(days=1)

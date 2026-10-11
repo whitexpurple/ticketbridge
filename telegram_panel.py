@@ -9,9 +9,8 @@ from datetime import datetime, timezone
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 from telegram.ext import CommandHandler, CallbackQueryHandler, MessageHandler, filters
-from dotenv import dotenv_values
 
-from discord_session import DiscordConnectionError, ENV_PATH, login_request
+from discord_session import DiscordConnectionError, login_request
 from delivery import chunks
 
 SETUP_TTL = 300
@@ -59,9 +58,10 @@ async def start(update, context):
         return
     clear_setup(context)
     await update.effective_message.reply_text(
-        "Ticket Forwarder\n\nAutomatic discovery across all servers on your Discord account.",
+        "Ticket Forwarder\n\nAutomatic discovery across connected Discord accounts.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Connect Discord", callback_data="connect")],
+            [InlineKeyboardButton("Discord accounts", callback_data="accounts")],
             [InlineKeyboardButton("Connection status", callback_data="status")],
             [InlineKeyboardButton("My servers", callback_data="servers")],
         ]),
@@ -79,7 +79,7 @@ async def connect(update, context):
         "Connect Discord\n\nSend your Discord email address. "
         "Next I will ask for your password and, if needed, a two-factor code. "
         "I will attempt to delete those messages; email/password are not saved to disk. "
-        "The resulting session token is saved locally in .env.\n\n"
+        "The session token is stored in the restricted local account store, not .env.\n\n"
         "Setup expires in 5 minutes. Use /cancel to stop."
     )
 
@@ -96,35 +96,48 @@ async def reconnect(update, context):
     if not is_authorized(update):
         return
     clear_setup(context)
-    token = dotenv_values(ENV_PATH).get("DISCORD_TOKEN")
-    if not token:
-        await update.effective_message.reply_text("No saved token. Use /connect to sign in first.")
+    manager = context.application.bot_data["discord_session"]
+    disconnected = [item for item in manager.summaries() if not item["connected"]]
+    if not disconnected:
+        await update.effective_message.reply_text("All saved Discord accounts are connected.")
         return
-    logger.info("Telegram /reconnect received; reusing saved token without password login.")
-    await update.effective_message.reply_text("Connecting with the saved Discord token...")
-    try:
-        username = await context.application.bot_data["discord_session"].connect(token, persist=False)
-        await update.effective_message.reply_text(f"Connected as {username}.")
-    except DiscordConnectionError as error:
-        logger.warning("Saved-token connection failed: %s", error)
-        await update.effective_message.reply_text(str(error))
+    results = []
+    for account in disconnected:
+        try:
+            _, username = await manager.reconnect(account["id"])
+            results.append(f"Connected: {username}")
+        except DiscordConnectionError as error:
+            results.append(f"Failed: {account['username']} ({error})")
+    await update.effective_message.reply_text("\n".join(results))
 
 
 async def status(update, context):
     if not is_authorized(update):
         return
     session = context.application.bot_data["discord_session"]
-    client = session.client
-    if not client:
-        text = "Discord is disconnected. Use /connect to sign in."
+    if hasattr(session, "summaries"):
+        accounts = session.summaries()
     else:
-        text = (f"Discord: {(client.user or {}).get('username', 'Connecting')}\n"
-                f"Gateway: {'connected' if client.ready.is_set() else 'reconnecting'}\n"
-                f"Servers monitored: {len(client.guilds_list)}\n"
-                "Discovery: automatic, across all accessible channels and threads.\n"
-                "Tickets hidden from this account cannot be detected.")
+        client = session.client
+        accounts = ([{"id": str((client.user or {}).get("id", "unknown")),
+                      "username": (client.user or {}).get("username", "Discord account"),
+                      "session": session, "guilds": client.guilds_list,
+                      "connected": client.ready.is_set()}] if client else [])
+    if not accounts:
+        text = "No Discord accounts are connected. Use /connect to add one."
+    else:
+        lines = [f"Discord accounts: {len(accounts)}"]
+        for account in accounts:
+            lines.append(f"\n{account['username']} ({account['id']})"
+                         f"\nGateway: {'connected' if account['connected'] else 'disconnected'}"
+                         f"\nServers: {len(account['guilds'])}")
+            discovery = account["session"].discovery if account["session"] else None
+            if discovery:
+                lines.append(f"Active tickets: {len(discovery.active_channel_ids())}; "
+                             f"last scan: {datetime.fromtimestamp(discovery.last_scan, timezone.utc).strftime('%Y-%m-%d %H:%M UTC') if discovery.last_scan else 'pending'}")
+        text = "\n".join(lines)
     discovery = session.discovery
-    if discovery:
+    if discovery and len(accounts) == 1:
         scanned = (datetime.fromtimestamp(discovery.last_scan, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
                    if discovery.last_scan else "Not completed yet")
         active = len(discovery.active_channel_ids())
@@ -196,13 +209,74 @@ async def servers(update, context, page=0):
     if not is_authorized(update):
         return
     session = context.application.bot_data.get("discord_session")
-    client = session.client if session else None
-    if client is None:
-        text = "Discord is disconnected. Use /connect to sign in."
-        markup = InlineKeyboardMarkup([[InlineKeyboardButton("Close", callback_data="servers:close")]])
-    else:
-        text, markup = server_page(client, page)
+    if session and not hasattr(session, "summaries"):
+        client = session.client
+        if client is None:
+            text = "Discord is disconnected. Use /connect to sign in."
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton("Close", callback_data="servers:close")]])
+        else:
+            text, markup = server_page(client, page)
+        await context.application.bot_data["server_lists"].show(update, text, markup)
+        return
+    accounts = session.summaries() if session else []
+    aggregate = {}
+    for account in accounts:
+        for guild in account["guilds"]:
+            item = aggregate.setdefault(str(guild.get("id")), {"guild": guild, "accounts": []})
+            item["accounts"].append(account["username"])
+    entries = sorted(aggregate.values(), key=lambda item: str(item["guild"].get("name", "")).casefold())
+    text, markup = server_entries_page(entries, page, "All Discord servers")
     await context.application.bot_data["server_lists"].show(update, text, markup)
+
+
+def server_entries_page(entries, page, title):
+    page_size = 15
+    total = len(entries)
+    pages = max(1, (total + page_size - 1) // page_size)
+    page = min(max(0, page), pages - 1)
+    lines = [f"{title}: {total}"]
+    if not total:
+        lines.append("No servers are currently available.")
+    for index, item in enumerate(entries[page * page_size:(page + 1) * page_size], page * page_size + 1):
+        guild = item["guild"]
+        name = " ".join(str(guild.get("name") or "Unknown server").split())[:100]
+        lines.append(f"\n{index}. {name}\nID: {guild.get('id', 'Unknown')}\nAccount: {', '.join(item['accounts'])}")
+    buttons = []
+    if page:
+        buttons.append(InlineKeyboardButton("Previous", callback_data=f"servers:{page - 1}"))
+    if page + 1 < pages:
+        buttons.append(InlineKeyboardButton("Next", callback_data=f"servers:{page + 1}"))
+    keyboard = [buttons] if buttons else []
+    if pages > 1:
+        lines.append(f"\nPage {page + 1} of {pages}")
+    keyboard.append([InlineKeyboardButton("Close", callback_data="servers:close")])
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard)
+
+
+async def accounts(update, context):
+    if not is_authorized(update):
+        return
+    items = context.application.bot_data["discord_session"].summaries()
+    lines = [f"Discord accounts: {len(items)}"]
+    keyboard = [[InlineKeyboardButton("Add account", callback_data="connect")]]
+    for item in items:
+        state = "connected" if item["connected"] else "disconnected"
+        lines.append(f"\n{item['username']} · {state} · {len(item['guilds'])} servers\nID: {item['id']}")
+        keyboard.append([InlineKeyboardButton(f"Remove {item['username'][:30]}",
+                                               callback_data=f"account:remove:{item['id']}")])
+    keyboard.append([InlineKeyboardButton("Close", callback_data="accounts:close")])
+    await context.application.bot_data["server_lists"].show(update, "\n".join(lines), InlineKeyboardMarkup(keyboard))
+
+
+async def server_account_picker(update, context):
+    if not is_authorized(update):
+        return
+    items = context.application.bot_data["discord_session"].summaries()
+    keyboard = [[InlineKeyboardButton(item["username"][:50], callback_data=f"server-account:{item['id']}")]
+                for item in items]
+    keyboard.append([InlineKeyboardButton("Close", callback_data="servers:close")])
+    await context.application.bot_data["server_lists"].show(
+        update, "Choose a Discord account to view its servers:", InlineKeyboardMarkup(keyboard))
 
 
 async def button_handler(update, context):
@@ -214,6 +288,34 @@ async def button_handler(update, context):
     action = update.callback_query.data
     if action == "connect":
         await connect(update, context)
+    elif action == "accounts":
+        await accounts(update, context)
+    elif action == "accounts:close":
+        message = update.effective_message
+        await context.application.bot_data["server_lists"].close(message.chat_id, message.message_id)
+    elif action.startswith("account:remove:"):
+        account_id = action.rsplit(":", 1)[-1]
+        record = next((item for item in context.application.bot_data["discord_session"].summaries()
+                       if item["id"] == account_id), None)
+        if not record:
+            await update.effective_message.reply_text("That account is no longer connected.")
+            return
+        await update.effective_message.reply_text(
+            f"Remove {record['username']}? This disconnects it and deletes its saved token. "
+            "It does not leave servers or close tickets; ticket history and reports stay in the database.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Confirm removal", callback_data=f"account:confirm-remove:{account_id}"),
+                InlineKeyboardButton("Cancel", callback_data="accounts"),
+            ]]))
+    elif action.startswith("account:confirm-remove:"):
+        account_id = action.rsplit(":", 1)[-1]
+        manager = context.application.bot_data["discord_session"]
+        record = next((item for item in manager.summaries() if item["id"] == account_id), None)
+        username = record["username"] if record else "Discord account"
+        removed = await manager.remove(account_id)
+        await update.effective_message.edit_text(
+            f"Removed {username}. Ticket history and reports were retained." if removed
+            else "That account was already removed.")
     elif action == "status":
         await status(update, context)
     elif action == "servers:close":
@@ -227,6 +329,18 @@ async def button_handler(update, context):
         except ValueError:
             page = 0
         await servers(update, context, page)
+    elif action == "server-picker":
+        await server_account_picker(update, context)
+    elif action.startswith("server-account:"):
+        account_id = action.split(":", 1)[1]
+        account = next((item for item in context.application.bot_data["discord_session"].summaries()
+                        if item["id"] == account_id), None)
+        if not account:
+            await update.effective_message.reply_text("That account is no longer available.")
+            return
+        entries = [{"guild": guild, "accounts": [account["username"]]} for guild in account["guilds"]]
+        text, markup = server_entries_page(entries, 0, f"{account['username']} servers")
+        await context.application.bot_data["server_lists"].show(update, text, markup)
     else:
         await update.effective_message.reply_text("Manual category setup is no longer needed. Use /start.")
 
@@ -293,22 +407,25 @@ async def setup_message(update, context):
             return
         clear_setup(context)
         await update.effective_message.reply_text("Signing in to Discord...")
-        username = await context.application.bot_data["discord_session"].connect(result["token"])
+        manager = context.application.bot_data["discord_session"]
+        if hasattr(manager, "add"):
+            _account_id, username = await manager.add(result["token"])
+        else:
+            username = await manager.connect(result["token"])
         result.clear()
         await update.effective_message.reply_text(
-            f"Connected as {username}. Automatic ticket discovery is active across all your servers."
+            f"Added {username}. Automatic discovery is active across its accessible servers."
         )
     except DiscordConnectionError as error:
         logger.warning("Discord setup connection failed: %s", error)
         clear_setup(context)
-        await update.effective_message.reply_text(str(error) + " Any previous connection has been kept. "
-                                                 "If the token was saved, /reconnect retries it without another password login.")
+        await update.effective_message.reply_text(str(error) + " Existing accounts remain unchanged. Use /accounts to review them.")
     except Exception as error:
         logger.error("Discord setup failed: stage=%s exception_type=%s", step, type(error).__name__)
         clear_setup(context)
         await update.effective_message.reply_text(
             "Discord setup could not finish. Check your login and connection, then use /connect again. "
-            "Any previous connection has been kept."
+            "Existing accounts remain unchanged."
         )
 
 
@@ -322,7 +439,8 @@ def register_handlers(application):
     application.add_error_handler(telegram_error_handler)
     for command, handler in (("start", start), ("connect", connect), ("reconnect", reconnect),
                              ("cancel", cancel), ("status", status), ("report", report),
-                             ("servers", servers)):
+                             ("servers", servers), ("accounts", accounts),
+                             ("server", server_account_picker)):
         application.add_handler(CommandHandler(command, handler))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, setup_message))

@@ -119,7 +119,8 @@ class NotificationOutbox:
         try:
             with conn:
                 if mutation:
-                    mutation(conn)
+                    if mutation(conn) is False:
+                        return
                 self.insert(conn, text, key, entities)
         finally:
             conn.close()
@@ -199,26 +200,58 @@ class NotificationOutbox:
 
 
 class TicketDelivery:
-    def __init__(self, outbox, account_id):
+    def __init__(self, outbox, account_id, account_name="Discord"):
         self.outbox, self.account_id = outbox, str(account_id)
+        self.account_name = str(account_name or "Discord")
+
+    def _account_text(self, text):
+        return f"Discord account: {self.account_name}\n{text}"
+
+    def _account_entities(self, entities):
+        if not entities:
+            return entities
+        offset = utf16_length(f"Discord account: {self.account_name}\n")
+        return [{**entity, "offset": int(entity["offset"]) + offset} for entity in entities]
 
     def opened(self, values, text, entities=None):
         channel_id = str(values[0])
         def mutation(conn):
+            existing = conn.execute("SELECT account_id FROM tickets WHERE channel_id=?", (channel_id,)).fetchone()
+            if existing and existing[0] not in (None, self.account_id):
+                return False
             conn.execute("""INSERT OR IGNORE INTO tickets
-                (channel_id,guild_id,channel_name,user_id,user_name,opened_at,active,user_confirmed)
-                VALUES (?,?,?,?,?,?,1,0)""", values)
+                (channel_id,guild_id,channel_name,user_id,user_name,opened_at,active,user_confirmed,account_id)
+                VALUES (?,?,?,?,?,?,1,0,?)""", (*values, self.account_id))
+            conn.execute("UPDATE tickets SET account_id=? WHERE channel_id=? AND account_id IS NULL",
+                         (self.account_id, channel_id))
             conn.execute("INSERT OR IGNORE INTO tracked_channels(account_id,channel_id) VALUES (?,?)",
                          (self.account_id, channel_id))
-        self.outbox.enqueue(text, f"{self.account_id}:open:{channel_id}", mutation, entities)
+            return True
+        self.outbox.enqueue(self._account_text(text), f"{self.account_id}:open:{channel_id}", mutation,
+                            self._account_entities(entities))
 
     def closed(self, channel_id, text, entities=None):
         closed_at = datetime.now(timezone.utc).isoformat()
-        self.outbox.enqueue(text, f"{self.account_id}:close:{channel_id}",
+        conn = get_connection()
+        try:
+            owner = conn.execute("SELECT account_id FROM tickets WHERE channel_id=?", (str(channel_id),)).fetchone()
+        finally:
+            conn.close()
+        if owner and owner[0] not in (None, self.account_id):
+            return
+        self.outbox.enqueue(self._account_text(text), f"{self.account_id}:close:{channel_id}",
                             lambda conn: conn.execute("UPDATE tickets SET active=0, closed_at=COALESCE(closed_at, ?) WHERE channel_id=?",
-                                                      (closed_at, str(channel_id))), entities)
+                                                      (closed_at, str(channel_id))), self._account_entities(entities))
 
     def message(self, channel_id, message_id, text, entities=None):
         if not message_id:
             raise ValueError("A Discord message ID is required for reliable delivery")
-        self.outbox.enqueue(text, f"{self.account_id}:message:{message_id}", entities=entities)
+        conn = get_connection()
+        try:
+            owner = conn.execute("SELECT account_id FROM tickets WHERE channel_id=?", (str(channel_id),)).fetchone()
+        finally:
+            conn.close()
+        if owner and owner[0] not in (None, self.account_id):
+            return
+        self.outbox.enqueue(self._account_text(text), f"{self.account_id}:message:{message_id}",
+                            entities=self._account_entities(entities))

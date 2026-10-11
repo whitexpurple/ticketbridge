@@ -496,7 +496,7 @@ class SetupTests(unittest.IsolatedAsyncioTestCase):
         old = Mock()
         session.client = old
         with patch.object(CustomDiscordClient, "start", AsyncMock(side_effect=GatewayConnectionError("test rejection"))), \
-             patch("discord_session.set_key"):
+             patch("discord_session.ENV_PATH"):
             with self.assertRaises(ValueError):
                 await session.connect("invalid-test-token")
         self.assertIs(session.client, old)
@@ -510,35 +510,31 @@ class SetupTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(CustomDiscordClient, "_api_get", return_value={"id": "9"}), \
              patch.object(CustomDiscordClient, "start", AsyncMock(side_effect=GatewayConnectionError(
                  "Gateway closed: received=4013 sent=4013; invalid intents."))), \
-             patch("discord_session.set_key") as save:
+             patch("discord_session.ENV_PATH"):
             with self.assertRaisesRegex(ValueError, "4013"):
                 await asyncio.wait_for(session.connect("test-token"), timeout=2)
-            save.assert_called_once()
             self.assertIs(session.client, old)
             old.close.assert_not_awaited()
 
-    async def test_successful_switch_saves_token_and_stops_old_account(self):
+    async def test_successful_session_reconnect_stops_its_previous_client(self):
         app = SimpleNamespace(bot_data={})
         session = DiscordSession(app, AsyncMock(), None)
         old = SimpleNamespace(close=AsyncMock())
         session.client = old
         async def fake_start(client):
-            save.assert_called_once()
             client.user = {"id": "9", "username": "NewAccount"}
             client.ready.set()
             await asyncio.Event().wait()
         with patch.object(CustomDiscordClient, "_api_get", side_effect=AssertionError("Unexpected account preflight")), \
              patch.object(CustomDiscordClient, "start", fake_start), \
-             patch("discord_session.set_key") as save, \
              patch("discord_session.TicketDiscovery.run", AsyncMock()):
             result = await session.connect("new-test-token")
             self.assertEqual(result, "NewAccount")
             old.close.assert_awaited_once()
-            self.assertEqual(save.call_args.args[1:], ("DISCORD_TOKEN", "new-test-token"))
             self.assertIs(app.bot_data["discord_client"], session.client)
             await session.close()
 
-    async def test_failed_gateway_retains_token_for_restart(self):
+    async def test_gateway_session_does_not_write_tokens_to_env(self):
         with tempfile.TemporaryDirectory() as directory:
             env = Path(directory) / ".env"
             session = DiscordSession(SimpleNamespace(bot_data={}), AsyncMock(), None)
@@ -547,7 +543,7 @@ class SetupTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(ValueError):
                     await session.connect("test-issued-token")
             from dotenv import dotenv_values
-            self.assertEqual(dotenv_values(env)["DISCORD_TOKEN"], "test-issued-token")
+            self.assertNotIn("DISCORD_TOKEN", dotenv_values(env))
 
     async def test_gateway_identifies_once_before_hello(self):
         client = CustomDiscordClient("test-session")

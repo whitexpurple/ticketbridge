@@ -18,12 +18,17 @@ class HealthMonitor:
 
     def current_issues(self):
         issues = {}
-        client = self.session.client
-        if client is not None and (not client.ready.is_set() or self.session.connection_error):
-            issues["discord_gateway"] = "Discord gateway is disconnected."
-
-        discovery = self.session.discovery
-        if discovery and client is not None and client.ready.is_set():
+        sessions = (list(self.session.sessions.values()) if hasattr(self.session, "sessions")
+                    else [self.session])
+        disconnected = []
+        scan_issues = []
+        for session in sessions:
+            client = session.client
+            if client is not None and (not client.ready.is_set() or session.connection_error):
+                disconnected.append(str((client.user or {}).get("username", "Discord account")))
+            discovery = session.discovery
+            if not discovery or client is None or not client.ready.is_set():
+                continue
             now = time.time()
             threshold = max(600, discovery.interval * 5)
             last_success = discovery.last_successful_scan
@@ -31,11 +36,13 @@ class HealthMonitor:
             if ((last_success and now - last_success > threshold)
                     or (discovery.last_scan_error and now - scan_anchor > threshold)):
                 detail = f" Last scan detail: {discovery.last_scan_error}." if discovery.last_scan_error else ""
-                issues["ticket_discovery"] = (
-                    "No fully successful ticket discovery scan has completed recently." + detail
-                )
+                scan_issues.append(f"{(client.user or {}).get('username', 'Discord account')}: {detail.strip()}")
             elif discovery.scan_running and discovery.scan_started_at and now - discovery.scan_started_at > threshold:
-                issues["ticket_discovery"] = "A ticket discovery scan has been running unusually long."
+                scan_issues.append(f"{(client.user or {}).get('username', 'Discord account')}: scan running unusually long")
+        if disconnected:
+            issues["discord_gateway"] = "Discord gateway disconnected for: " + ", ".join(disconnected)
+        if scan_issues:
+            issues["ticket_discovery"] = "No healthy discovery scan recently for: " + "; ".join(scan_issues)
 
         try:
             age = self.outbox.pending_age()

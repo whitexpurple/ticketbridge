@@ -11,7 +11,7 @@ from telegram.ext import Application
 from telegram.request import HTTPXRequest
 
 from database import init_db
-from discord_session import DiscordSession
+from discord_accounts import DiscordAccounts
 from delivery import NotificationOutbox
 from daily_report import DailyReportWorker
 from health_monitor import HealthMonitor
@@ -77,12 +77,13 @@ async def main():
     server_lists = ServerLists(app.bot)
     app.bot_data["server_lists"] = server_lists
 
-    session = DiscordSession(app, send, limiter, os.getenv("DISCORD_BOT_TOKEN"),
-                             float(os.getenv("TICKET_SCAN_INTERVAL", "60")))
+    session = DiscordAccounts(app, send, limiter, os.getenv("DISCORD_BOT_TOKEN"),
+                              float(os.getenv("TICKET_SCAN_INTERVAL", "60")))
     daily_reports = DailyReportWorker(
         outbox,
         os.getenv("DAILY_REPORT_TIMEZONE", "Etc/GMT-1"),
-        lambda: session.client.guilds_list if session.client else [],
+        lambda: [guild for account in session.summaries() for guild in account["guilds"]],
+        session.summaries,
     )
     app.bot_data["daily_report_worker"] = daily_reports
     health_monitor = HealthMonitor(session, outbox)
@@ -95,19 +96,17 @@ async def main():
         health_monitor_task = None
         try:
             await app.start()
+            await app.updater.start_polling(bootstrap_retries=-1)
+            logger.info("Telegram ready. Use /connect to connect Discord.")
+            try:
+                await session.start_saved()
+                logger.info("Loaded %d saved Discord account(s).", len(session.sessions))
+            except Exception as error:
+                logger.error("Discord account store could not be initialized: %s", error)
             delivery_task = asyncio.create_task(outbox.run())
             server_lists_task = asyncio.create_task(server_lists.run())
             daily_reports_task = asyncio.create_task(daily_reports.run())
             health_monitor_task = asyncio.create_task(health_monitor.run())
-            await app.updater.start_polling(bootstrap_retries=-1)
-            logger.info("Telegram ready. Use /connect to connect Discord.")
-            existing_token = os.getenv("DISCORD_TOKEN")
-            if existing_token:
-                try:
-                    await session.connect(existing_token, persist=False)
-                    logger.info("Saved Discord session connected; automatic discovery enabled.")
-                except Exception:
-                    logger.warning("Saved Discord session could not connect. Use /connect in Telegram.")
             await asyncio.Event().wait()
         finally:
             await session.close()

@@ -104,9 +104,12 @@ closure messages. Mere inactivity archival does not imply closure. Mava/MEE6
 custom formats are not live-verified; inaccessible threads and unrecognized
 formats can still be missed. The incorrect total-server "Mutuals" field is removed.
 
-Telegram `/status` reports gateway health, active tracked tickets, scan times,
-pending events, queued notifications, and delivery errors. `/reconnect` reuses
-the saved token; it does not request your password again.
+Telegram `/accounts` lists connected Discord accounts and server counts, with
+an Add flow and a confirmed Remove action. Removing an account disconnects it
+and deletes its saved token; it does not leave servers or erase ticket history.
+`/connect` adds another account without replacing existing ones. `/reconnect`
+retries saved accounts that are not currently connected. `/status` reports
+gateway and discovery health for connected accounts.
 Ticket open, close, and message notifications format detail values for easier
 copying and include an inline **Open Server** link to the owning Discord server.
 At midnight each day, TicketBridge queues a daily ticket report to Telegram.
@@ -120,6 +123,8 @@ The reporting date is saved with the notification queue to avoid duplicate
 reports after restarts. A fresh installation starts at the next midnight. If the
 service is down at a scheduled midnight, it sends missed reports when it starts
 again.
+Daily reports are generated separately for each saved account and identify the
+account in the heading. `/report` returns the current-day report for each account.
 The daily report only lists servers with ticket openings or closures during
 that reporting period, with per-server opened and closed totals. Discovery
 failure causes are retained for troubleshooting and quiet health alerts
@@ -130,13 +135,20 @@ the five-minute alert confirmation period. Each incident produces one alert and
 one recovery notice through the durable notification queue.
 Guild endpoints that return HTTP 403 are marked inaccessible for 24 hours and
 then retried; these expected access denials do not make scans unhealthy.
-`/servers` lists all servers in the connected account's cached server list, with
-the total count, server IDs, and Previous/Next buttons for lists over 15 servers.
-The same list is available from **My servers** in `/start`.
+`/servers` lists unique servers across all connected accounts, with account
+names and server IDs. `/server` first asks which account's server list to show.
+Both lists use Previous/Next buttons when there are more than 15 servers. The
+aggregate list is also available from **My servers** in `/start`.
 Every server list includes a **Close** button and automatically closes 15 minutes
 after opening. Page changes do not extend the timer. Deadlines survive restarts;
 overdue lists close when the bot is back online. If deletion is unavailable, the
 bot replaces the list with a closed notice. Temporary Telegram failures retry.
+
+Discord session tokens are stored in `data/discord_accounts.json`, not `.env`.
+The file is written atomically with owner-only permissions where supported and
+is covered by the existing `/data/` Git ignore rule. Protect this file and its
+backups as credentials. A legacy `DISCORD_TOKEN` in `.env` is migrated once to
+the account store and removed from `.env`.
 
 After uploading updated source files to the VPS:
 

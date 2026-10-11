@@ -9,7 +9,6 @@ import re
 import http.client
 from pathlib import Path
 
-from dotenv import set_key
 
 from custom_discord import CustomDiscordClient, GatewayConnectionError
 from discord_handler import DiscordHandler
@@ -144,19 +143,12 @@ class DiscordSession:
         self.connection_error = None
         self.events = None
 
-    async def connect(self, token, persist=True):
-        logger.info("Discord connection requested: source=%s.", "Telegram login" if persist else "saved session")
+    async def connect(self, token, source="saved account"):
+        logger.info("Discord connection requested: source=%s.", source)
         async with self.lock:
             token = token.strip().strip("\"'")
             if not token:
                 raise DiscordConnectionError("No saved Discord token is available. Use /connect first.")
-            if persist:
-                try:
-                    set_key(str(ENV_PATH), "DISCORD_TOKEN", token)
-                    logger.info("Discord session token saved to project .env (value omitted).")
-                except OSError:
-                    raise DiscordConnectionError("Discord issued a token, but it could not be saved to .env. "
-                                                 "Check the file's write permissions.") from None
             candidate = CustomDiscordClient(token, self.bot_token)
             logger.info("Connecting to Discord gateway with the saved token.")
             task = asyncio.create_task(candidate.start())
@@ -176,7 +168,7 @@ class DiscordSession:
                     raise DiscordConnectionError("The gateway connection ended before it became ready. "
                                                  f"{error}") from None
                 outbox = self.app.bot_data.get("notification_outbox")
-                delivery = TicketDelivery(outbox, candidate.user["id"]) if outbox else None
+                delivery = TicketDelivery(outbox, candidate.user["id"], candidate.user.get("username")) if outbox else None
                 handler = DiscordHandler(candidate, self.send, self.limiter, delivery=delivery)
                 discovery = TicketDiscovery(candidate, handler, self.interval)
             except BaseException:
