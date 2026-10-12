@@ -615,5 +615,26 @@ class SetupTests(unittest.IsolatedAsyncioTestCase):
             initialize.assert_not_called()
 
 
+class ServerInviteTests(unittest.TestCase):
+    def test_creates_and_reuses_invite_from_visible_text_channel(self):
+        client = CustomDiscordClient("test-session")
+        client.guilds["42"] = {"id": "42", "channels": [
+            channel(id="private", guild="42", permission_overwrites=[
+                {"id": "42", "type": 0, "deny": str(1 << 10)},
+            ]),
+            channel(id="public", guild="42"),
+        ]}
+        with patch.object(client, "_api_post", return_value={"code": "example"}) as create:
+            self.assertEqual(client.create_server_invite("42"), "https://discord.gg/example")
+            self.assertEqual(client.create_server_invite("42"), "https://discord.gg/example")
+        create.assert_called_once_with("/api/v10/channels/public/invites", {
+            "max_age": 604800, "max_uses": 0, "temporary": False, "unique": False,
+        })
+
+    def test_invite_creation_falls_back_when_no_channels_are_cached(self):
+        client = CustomDiscordClient("test-session")
+        self.assertIsNone(client.create_server_invite("42"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -51,6 +51,7 @@ class DiscordHandler:
         self.telegram_send = telegram_send
         self.rate_limiter = rate_limiter
         self.delivery = delivery
+        self._invite_lock = asyncio.Lock()
 
         # IMPORTANT:
         #
@@ -65,6 +66,18 @@ class DiscordHandler:
         # This survives bot restarts and also allows the database
         # UPDATE to atomically decide which message establishes
         # the ticket owner.
+
+    async def server_link(self, guild_id):
+        """Return a reusable server invite, falling back to Discord navigation."""
+        fallback = discord_server_url(guild_id)
+        if not fallback or not hasattr(self.client, "create_server_invite"):
+            return fallback
+        async with self._invite_lock:
+            invite = await asyncio.to_thread(self.client.create_server_invite, str(guild_id))
+        if invite:
+            return invite
+        logger.info("Could not create a Discord invite for server %s; using server navigation link", guild_id)
+        return fallback
 
     # =====================================================
     # USER HELPERS
@@ -890,7 +903,7 @@ class DiscordHandler:
         notification.field("📊 Tickets Today (User)", user_tickets_today)
         notification.field("📅 Account Age", account_age)
         notification.add(f"\n🕐 Opened: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n")
-        server_url = discord_server_url(guild_id)
+        server_url = await self.server_link(guild_id)
         if server_url:
             notification.link("Open Server", server_url)
         text, entities = notification.render()
@@ -1434,7 +1447,7 @@ class DiscordHandler:
                     notification.add(f"\n{url}")
 
         notification.add("\n\n")
-        server_url = discord_server_url(guild_id)
+        server_url = await self.server_link(guild_id)
         if server_url:
             notification.link("Open Server", server_url)
         output, entities = notification.render()
@@ -1763,7 +1776,7 @@ class DiscordHandler:
         notification.field("📊 Tickets Today (User)", user_tickets_today)
         notification.field("📅 Account Age", account_age)
         notification.add(f"\n⏱️ Duration: {duration}\n\n")
-        server_url = discord_server_url(ticket[1])
+        server_url = await self.server_link(ticket[1])
         if server_url:
             notification.link("Open Server", server_url)
         output, entities = notification.render()

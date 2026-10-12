@@ -62,6 +62,7 @@ class CustomDiscordClient:
         self._user_retry_after = {}
         self._rest_lock = threading.Lock()
         self._last_rest_request = 0.0
+        self._server_invites = {}
 
         self._handlers = {}
         self._running = False
@@ -193,6 +194,108 @@ class CustomDiscordClient:
         finally:
             if conn:
                 conn.close()
+
+    def _api_post(self, path, payload):
+        """Create a Discord resource using the connected account session."""
+        token = self._clean_token(self.token)
+        key = ("self", path)
+        if not token:
+            self._rest_errors[key] = "Discord session token unavailable"
+            return None
+        if key in self._forbidden_rest_paths:
+            self._rest_errors[key] = "HTTP 403 access denied"
+            return None
+        with self._rest_lock:
+            wait_until = max(self._retry_after.get(key, 0), self._global_retry_after)
+            delay = wait_until - time.monotonic()
+            if delay > 0:
+                self._rest_errors[key] = f"request cooldown {int(delay)}s"
+                return None
+            delay = self.REST_MIN_INTERVAL - (time.monotonic() - self._last_rest_request)
+            if delay > 0:
+                time.sleep(delay)
+            self._last_rest_request = time.monotonic()
+        conn = None
+        try:
+            conn = http.client.HTTPSConnection("discord.com", timeout=15)
+            conn.request(
+                "POST", path, body=json.dumps(payload),
+                headers={
+                    "Authorization": token,
+                    "User-Agent": "TicketBridge/1.0",
+                    "Content-Type": "application/json",
+                },
+            )
+            response = conn.getresponse()
+            body = response.read()
+            if response.status not in (200, 201):
+                retry = 600 if response.status in (403, 404) else 60
+                if response.status == 429:
+                    try:
+                        detail = json.loads(body)
+                        retry = max(1, float(response.getheader("Retry-After") or detail.get("retry_after", 60)))
+                        if detail.get("global"):
+                            self._global_retry_after = time.monotonic() + retry
+                    except (TypeError, ValueError):
+                        pass
+                self._retry_after[key] = time.monotonic() + retry
+                self._rest_errors[key] = f"HTTP {response.status}"
+                if response.status not in (403, 404):
+                    logger.warning("Discord REST request failed: method=POST path=%s status=%s", path, response.status)
+                return None
+            result = json.loads(body.decode("utf-8"))
+            self._rest_errors.pop(key, None)
+            return result
+        except Exception:
+            self._rest_errors[key] = "network error"
+            logger.exception("Discord REST POST errored: path=%s", path)
+            return None
+        finally:
+            if conn:
+                conn.close()
+
+    def create_server_invite(self, guild_id):
+        """Create a reusable, seven-day invite for a guild text channel."""
+        guild_id = str(guild_id)
+        cached = self._server_invites.get(guild_id)
+        if cached and cached[1] > time.time():
+            return cached[0]
+        guild = self.guilds.get(guild_id) or {}
+        channels = guild.get("channels") or []
+        if not channels:
+            channels = [
+                channel for channel in self.channels.values()
+                if str(channel.get("guild_id")) == guild_id
+            ]
+        text_channels = [c for c in channels if c.get("type") == 0 and c.get("id")]
+        text_channels.sort(key=lambda c: (c.get("position", 0), str(c.get("id"))))
+        everyone_id = guild_id
+        for channel in text_channels:
+            blocked = False
+            for overwrite in channel.get("permission_overwrites", []):
+                if str(overwrite.get("id")) == everyone_id and overwrite.get("type", 0) == 0:
+                    try:
+                        blocked = bool(int(overwrite.get("deny", 0)) & 1024)
+                    except (TypeError, ValueError):
+                        pass
+                    break
+            if blocked:
+                continue
+            path = f"/api/v10/channels/{channel['id']}/invites"
+            invite = self._api_post(path, {
+                "max_age": 604800,
+                "max_uses": 0,
+                "temporary": False,
+                "unique": False,
+            })
+            code = invite.get("code") if isinstance(invite, dict) else None
+            if code:
+                url = f"https://discord.gg/{code}"
+                self._server_invites[guild_id] = (url, time.time() + 6 * 86400)
+                return url
+            if self._rest_errors.get(("self", path)) == "HTTP 403":
+                return None
+        return None
 
     def rest_failure_reason(self, path, use_bot_token=False):
         auth_kind = "bot" if use_bot_token else "self"
