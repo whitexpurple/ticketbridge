@@ -29,6 +29,7 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.client = CustomDiscordClient("test-token")
         self.client.user = {"id": "1", "username": "Tester"}
         self.client.guilds = {"10": {"id": "10", "name": "Support"}}
+        self.client.fetch_guild_channels = Mock(return_value=[])
         self.handler = DiscordHandler(self.client, AsyncMock(), delivery=TicketDelivery(self.outbox, "1"))
         self.handler.extract_user_from_channel = Mock(return_value=(None, "Unknown", "Unknown"))
         self.discovery = TicketDiscovery(self.client, self.handler)

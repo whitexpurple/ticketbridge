@@ -5,6 +5,7 @@ import logging
 import threading
 import time
 import zlib
+from datetime import datetime
 
 import websockets
 
@@ -162,7 +163,7 @@ class CustomDiscordClient:
                         pass
                 self._retry_after[forbidden_key] = time.monotonic() + delay
                 self._rest_errors[forbidden_key] = f"HTTP {response.status}"
-                if response.status not in (403, 404):
+                if response.status not in (400, 401, 403, 404):
                     logger.warning(
                         "Discord REST request failed: path=%s status=%s retry_after=%ss global=%s",
                         path,
@@ -229,7 +230,7 @@ class CustomDiscordClient:
             response = conn.getresponse()
             body = response.read()
             if response.status not in (200, 201):
-                retry = 600 if response.status in (403, 404) else 60
+                retry = 600 if response.status in (403, 404) else (0 if response.status == 400 else 60)
                 if response.status == 429:
                     try:
                         detail = json.loads(body)
@@ -240,7 +241,7 @@ class CustomDiscordClient:
                         pass
                 self._retry_after[key] = time.monotonic() + retry
                 self._rest_errors[key] = f"HTTP {response.status}"
-                if response.status not in (403, 404):
+                if response.status not in (400, 401, 403, 404):
                     logger.warning("Discord REST request failed: method=POST path=%s status=%s", path, response.status)
                 return None
             result = json.loads(body.decode("utf-8"))
@@ -255,46 +256,55 @@ class CustomDiscordClient:
                 conn.close()
 
     def create_server_invite(self, guild_id):
-        """Create a reusable, seven-day invite for a guild text channel."""
+        """Create and cache a current invite, trying channels until one succeeds."""
         guild_id = str(guild_id)
         cached = self._server_invites.get(guild_id)
-        if cached and cached[1] > time.time():
+        if cached and cached[1] > time.time() + 3600:
             return cached[0]
         guild = self.guilds.get(guild_id) or {}
         channels = guild.get("channels") or []
+        if not channels:
+            channels = self.fetch_guild_channels(guild_id)
         if not channels:
             channels = [
                 channel for channel in self.channels.values()
                 if str(channel.get("guild_id")) == guild_id
             ]
-        text_channels = [c for c in channels if c.get("type") == 0 and c.get("id")]
-        text_channels.sort(key=lambda c: (c.get("position", 0), str(c.get("id"))))
-        everyone_id = guild_id
-        for channel in text_channels:
-            blocked = False
-            for overwrite in channel.get("permission_overwrites", []):
-                if str(overwrite.get("id")) == everyone_id and overwrite.get("type", 0) == 0:
-                    try:
-                        blocked = bool(int(overwrite.get("deny", 0)) & 1024)
-                    except (TypeError, ValueError):
-                        pass
-                    break
-            if blocked:
-                continue
+        invite_channels = [
+            c for c in channels if c.get("type") in (0, 2, 5, 13) and c.get("id")
+        ]
+        invite_channels.sort(key=lambda c: (
+            c.get("type") not in (0, 5), c.get("position", 0), str(c.get("id"))
+        ))
+        for channel in invite_channels:
             path = f"/api/v10/channels/{channel['id']}/invites"
+            requested_age = 0
             invite = self._api_post(path, {
-                "max_age": 604800,
-                "max_uses": 0,
-                "temporary": False,
-                "unique": False,
+                "max_age": requested_age, "max_uses": 0, "temporary": False, "unique": True,
             })
+            if not isinstance(invite, dict) and self._rest_errors.get(("self", path)) == "HTTP 400":
+                requested_age = 604800
+                invite = self._api_post(path, {
+                    "max_age": requested_age, "max_uses": 0, "temporary": False, "unique": True,
+                })
             code = invite.get("code") if isinstance(invite, dict) else None
             if code:
                 url = f"https://discord.gg/{code}"
-                self._server_invites[guild_id] = (url, time.time() + 6 * 86400)
+                created_at = time.time()
+                expiry = invite.get("expires_at")
+                if expiry:
+                    try:
+                        expiry_time = datetime.fromisoformat(expiry.replace("Z", "+00:00")).timestamp()
+                    except (AttributeError, ValueError):
+                        expiry_time = created_at + (requested_age or 6 * 86400)
+                else:
+                    expiry_time = created_at + requested_age if requested_age else float("inf")
+                self._server_invites[guild_id] = (url, expiry_time)
                 return url
-            if self._rest_errors.get(("self", path)) == "HTTP 403":
-                return None
+            if self._rest_errors.get(("self", path)) == "HTTP 401":
+                break
+            if time.monotonic() < self._global_retry_after:
+                break
         return None
 
     def rest_failure_reason(self, path, use_bot_token=False):

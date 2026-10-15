@@ -1,7 +1,6 @@
 import asyncio
 import logging
 from datetime import datetime, timezone
-from urllib.parse import quote
 
 from database import (
     get_connection,
@@ -14,13 +13,6 @@ from database import (
 from delivery import TelegramNotification
 
 logger = logging.getLogger("discord-handler")
-
-
-def discord_server_url(guild_id):
-    guild_id = str(guild_id or "")
-    if not guild_id.isdigit():
-        return None
-    return f"https://discord.com/channels/{quote(guild_id, safe='')}"
 
 
 # =========================================================
@@ -68,16 +60,14 @@ class DiscordHandler:
         # the ticket owner.
 
     async def server_link(self, guild_id):
-        """Return a reusable server invite, falling back to Discord navigation."""
-        fallback = discord_server_url(guild_id)
-        if not fallback or not hasattr(self.client, "create_server_invite"):
-            return fallback
+        """Return only an invite link; never substitute a channel URL."""
+        if not str(guild_id or "").isdigit() or not hasattr(self.client, "create_server_invite"):
+            return None
         async with self._invite_lock:
             invite = await asyncio.to_thread(self.client.create_server_invite, str(guild_id))
-        if invite:
+        if isinstance(invite, str) and invite.startswith("https://discord.gg/"):
             return invite
-        logger.info("Could not create a Discord invite for server %s; using server navigation link", guild_id)
-        return fallback
+        return None
 
     # =====================================================
     # USER HELPERS

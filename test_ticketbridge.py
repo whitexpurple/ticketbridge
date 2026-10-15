@@ -28,6 +28,7 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
         database.init_db()
         self.client = CustomDiscordClient("test-only")
         self.client.guilds = {"1": {"id": "1", "name": "One"}, "2": {"id": "2", "name": "Two"}}
+        self.client.fetch_guild_channels = Mock(return_value=[])
         self.send = AsyncMock()
         self.handler = DiscordHandler(self.client, self.send)
         self.handler.extract_user_from_channel = Mock(return_value=(None, "Unknown", "Unknown"))
@@ -616,24 +617,58 @@ class SetupTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ServerInviteTests(unittest.TestCase):
-    def test_creates_and_reuses_invite_from_visible_text_channel(self):
+    def test_creates_and_reuses_non_expiring_invite(self):
         client = CustomDiscordClient("test-session")
         client.guilds["42"] = {"id": "42", "channels": [
-            channel(id="private", guild="42", permission_overwrites=[
-                {"id": "42", "type": 0, "deny": str(1 << 10)},
-            ]),
             channel(id="public", guild="42"),
         ]}
         with patch.object(client, "_api_post", return_value={"code": "example"}) as create:
             self.assertEqual(client.create_server_invite("42"), "https://discord.gg/example")
             self.assertEqual(client.create_server_invite("42"), "https://discord.gg/example")
         create.assert_called_once_with("/api/v10/channels/public/invites", {
-            "max_age": 604800, "max_uses": 0, "temporary": False, "unique": False,
+            "max_age": 0, "max_uses": 0, "temporary": False, "unique": True,
         })
 
-    def test_invite_creation_falls_back_when_no_channels_are_cached(self):
+    def test_no_cached_channels_produces_no_invite(self):
         client = CustomDiscordClient("test-session")
-        self.assertIsNone(client.create_server_invite("42"))
+        with patch.object(client, "fetch_guild_channels", return_value=[]):
+            self.assertIsNone(client.create_server_invite("42"))
+
+    def test_tries_next_channel_after_permission_denial(self):
+        client = CustomDiscordClient("test-session")
+        client.guilds["42"] = {"id": "42", "channels": [
+            channel(id="first", guild="42"), channel(id="second", guild="42"),
+        ]}
+
+        def create(path, payload):
+            client._rest_errors[("self", path)] = "HTTP 403 access denied"
+            if path.endswith("/first/invites"):
+                return None
+            return {"code": "second-channel"}
+
+        with patch.object(client, "_api_post", side_effect=create) as post:
+            self.assertEqual(client.create_server_invite("42"), "https://discord.gg/second-channel")
+        self.assertEqual(post.call_count, 2)
+
+
+class ServerInviteHandlerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_never_falls_back_to_server_navigation_url(self):
+        client = CustomDiscordClient("test-session")
+        handler = DiscordHandler(client, AsyncMock())
+        async def run_in_thread(func, *args):
+            return func(*args)
+        with patch.object(client, "create_server_invite", return_value=None), \
+             patch("discord_handler.asyncio.to_thread", side_effect=run_in_thread):
+            self.assertIsNone(await handler.server_link("42"))
+
+    async def test_returns_only_discord_invite_urls(self):
+        client = CustomDiscordClient("test-session")
+        handler = DiscordHandler(client, AsyncMock())
+        async def run_in_thread(func, *args):
+            return func(*args)
+        with patch.object(client, "create_server_invite", return_value="https://discord.gg/fresh"), \
+             patch("discord_handler.asyncio.to_thread", side_effect=run_in_thread):
+            self.assertEqual(await handler.server_link("42"), "https://discord.gg/fresh")
 
 
 if __name__ == "__main__":
