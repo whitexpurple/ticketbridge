@@ -9,10 +9,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import database
+from telegram.error import TelegramError
 from custom_discord import CustomDiscordClient, GatewayConnectionError
 from discord_handler import DiscordHandler
 from discord_session import DiscordSession, login_request, _post_auth
-from telegram_panel import begin_setup, clear_setup, is_authorized, setup_message
+from telegram_panel import addtoken, begin_setup, clear_setup, connect, is_authorized, setup_message
 from ticket_discovery import TicketDiscovery, ticket_reason
 
 
@@ -405,6 +406,34 @@ class SetupTests(unittest.IsolatedAsyncioTestCase):
         self.session.connect.assert_awaited_once_with("test-token")
         self.assertNotIn("discord_setup", self.context.user_data)
         self.assertEqual(self.message.delete.await_count, 3)
+
+    async def test_connect_prompt_offers_addtoken(self):
+        await connect(self.update, self.context)
+        self.assertIn("Setup expires in 5 minutes. Use /cancel to stop. Add token instead: /addtoken.",
+                      self.message.reply_text.await_args.args[0])
+
+    async def test_addtoken_deletes_input_and_uses_protected_account_manager(self):
+        manager = SimpleNamespace(add=AsyncMock(return_value=("99", "TokenUser")))
+        self.context.application.bot_data["discord_session"] = manager
+        await addtoken(self.update, self.context)
+        self.assertEqual(self.context.user_data["discord_setup"]["step"], "token")
+        self.message.text = "private-test-token"
+        await setup_message(self.update, self.context)
+        manager.add.assert_awaited_once_with("private-test-token")
+        self.assertTrue(self.message.delete.awaited)
+        replies = "\n".join(call.args[0] for call in self.message.reply_text.await_args_list)
+        self.assertNotIn("private-test-token", replies)
+        self.assertNotIn("discord_setup", self.context.user_data)
+
+    async def test_addtoken_aborts_if_telegram_cannot_delete_token_message(self):
+        manager = SimpleNamespace(add=AsyncMock(return_value=("99", "TokenUser")))
+        self.context.application.bot_data["discord_session"] = manager
+        await addtoken(self.update, self.context)
+        self.message.text = "private-test-token"
+        self.message.delete.side_effect = TelegramError("delete failed")
+        await setup_message(self.update, self.context)
+        manager.add.assert_not_awaited()
+        self.assertNotIn("discord_setup", self.context.user_data)
 
     async def test_other_user_and_group_cannot_enter_setup(self):
         self.update.effective_user.id = 99

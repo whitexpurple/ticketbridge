@@ -43,9 +43,9 @@ def clear_setup(context):
         task.cancel()
 
 
-def begin_setup(context):
+def begin_setup(context, step="email"):
     clear_setup(context)
-    state = {"step": "email", "expires": time.monotonic() + SETUP_TTL}
+    state = {"step": step, "expires": time.monotonic() + SETUP_TTL}
     context.user_data["discord_setup"] = state
 
     async def expire():
@@ -67,6 +67,7 @@ async def start(update, context):
         "Ticket Forwarder\n\nAutomatic discovery across connected Discord accounts.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Connect Discord", callback_data="connect")],
+            [InlineKeyboardButton("Add Discord token", callback_data="addtoken")],
             [InlineKeyboardButton("Discord accounts", callback_data="accounts")],
             [InlineKeyboardButton("Notification settings", callback_data="notifications")],
             [InlineKeyboardButton("Connection status", callback_data="status")],
@@ -87,7 +88,20 @@ async def connect(update, context):
         "Next I will ask for your password and, if needed, a two-factor code. "
         "I will attempt to delete those messages; email/password are not saved to disk. "
         "The session token is stored in the restricted local account store, not .env.\n\n"
-        "Setup expires in 5 minutes. Use /cancel to stop."
+        "Setup expires in 5 minutes. Use /cancel to stop. Add token instead: /addtoken."
+    )
+
+
+async def addtoken(update, context):
+    logger.info("Telegram /addtoken received.")
+    if not is_authorized(update):
+        logger.warning("Discord token setup denied: private administrator chat required.")
+        return
+    begin_setup(context, "token")
+    await update.effective_message.reply_text(
+        "Add Discord account token\n\nSend the token as your next message. "
+        "TicketBridge will delete that message, validate the token, and save the account "
+        "in the protected local account store, not .env. Setup expires in 5 minutes. Use /cancel to stop."
     )
 
 
@@ -326,6 +340,8 @@ async def button_handler(update, context):
     action = update.callback_query.data
     if action == "connect":
         await connect(update, context)
+    elif action == "addtoken":
+        await addtoken(update, context)
     elif action == "accounts":
         await accounts(update, context)
     elif action == "accounts:close":
@@ -429,18 +445,56 @@ async def setup_message(update, context):
         logger.info("Telegram setup message received without an active login; send /connect first.")
         await update.effective_message.reply_text("Use /connect to sign in or /status to check discovery.")
         return
-    value = update.effective_message.text
+    value = update.effective_message.text or ""
+    step = state["step"]
     try:
         await update.effective_message.delete()
     except TelegramError:
         logger.warning("Could not delete a Telegram setup message.")
+        if step == "token":
+            clear_setup(context)
+            await update.effective_message.reply_text(
+                "I could not delete that message, so I did not use the token. Delete it manually and retry /addtoken."
+            )
+            return
         await update.effective_message.reply_text("I could not delete your setup message. Delete it from this chat.")
     if not state or time.monotonic() >= state["expires"]:
         clear_setup(context)
         await update.effective_message.reply_text("Setup expired. Use /connect again.")
         return
-    step = state["step"]
     logger.info("Discord setup input received: stage=%s (content omitted).", step)
+    if step == "token":
+        token = value.strip()
+        if not token or len(token) > 2048 or any(character.isspace() for character in token):
+            await update.effective_message.reply_text("That token format is not valid. Send the token again or /cancel.")
+            return
+        clear_setup(context)
+        manager = context.application.bot_data["discord_session"]
+        await update.effective_message.reply_text("Validating the Discord token...")
+        try:
+            if hasattr(manager, "add"):
+                _account_id, username = await manager.add(token)
+            else:
+                username = await manager.connect(token)
+        except DiscordConnectionError as error:
+            logger.warning("Discord token setup failed: %s", error)
+            await update.effective_message.reply_text(
+                "The token could not be connected or saved. Check that it is valid, then use /addtoken again."
+            )
+            return
+        except Exception as error:
+            logger.error("Discord token setup failed: exception_type=%s", type(error).__name__)
+            await update.effective_message.reply_text(
+                "The token could not be connected. Check it and use /addtoken again."
+            )
+            return
+        finally:
+            token = ""
+            value = ""
+        await update.effective_message.reply_text(
+            f"Added {username}. Automatic discovery is active across its accessible servers."
+        )
+        return
     if step == "email":
         if "@" not in value or len(value) > 320:
             logger.info("Discord setup email format rejected; waiting for another email.")
@@ -513,7 +567,8 @@ async def telegram_error_handler(update, context):
 
 def register_handlers(application):
     application.add_error_handler(telegram_error_handler)
-    for command, handler in (("start", start), ("connect", connect), ("reconnect", reconnect),
+    for command, handler in (("start", start), ("connect", connect), ("addtoken", addtoken),
+                             ("reconnect", reconnect),
                              ("cancel", cancel), ("status", status), ("report", report),
                              ("servers", servers), ("accounts", accounts), ("notifications", notifications),
                              ("server", server_account_picker)):
