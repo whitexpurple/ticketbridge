@@ -137,6 +137,9 @@ def init_db():
                 delivered_at REAL, last_error TEXT, entities TEXT
             );
             CREATE INDEX IF NOT EXISTS outbox_pending ON notification_outbox(chat_id, delivered_at, id);
+            CREATE TABLE IF NOT EXISTS notification_preferences (
+                notification_type TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1
+            );
             CREATE INDEX IF NOT EXISTS active_tickets ON tickets(active, guild_id);
             CREATE TABLE IF NOT EXISTS gateway_inbox (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL,
@@ -197,6 +200,8 @@ def init_db():
         outbox_columns = {row[1] for row in conn.execute("PRAGMA table_info(notification_outbox)")}
         if "entities" not in outbox_columns:
             conn.execute("ALTER TABLE notification_outbox ADD COLUMN entities TEXT")
+        if "notification_type" not in outbox_columns:
+            conn.execute("ALTER TABLE notification_outbox ADD COLUMN notification_type TEXT")
 
         report_columns = {row[1] for row in conn.execute("PRAGMA table_info(daily_reports)")}
         if "account_id" not in report_columns:
@@ -215,6 +220,32 @@ def init_db():
             DB_PATH,
         )
 
+    finally:
+        conn.close()
+
+
+def get_notification_preference(notification_type):
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT enabled FROM notification_preferences WHERE notification_type=?",
+                           (str(notification_type),)).fetchone()
+        return bool(row[0]) if row else True
+    finally:
+        conn.close()
+
+
+def set_notification_preference(notification_type, enabled):
+    notification_type = str(notification_type)
+    enabled = bool(enabled)
+    conn = get_connection()
+    try:
+        with conn:
+            conn.execute("""INSERT INTO notification_preferences(notification_type, enabled) VALUES (?, ?)
+                ON CONFLICT(notification_type) DO UPDATE SET enabled=excluded.enabled""",
+                         (notification_type, int(enabled)))
+            if not enabled:
+                conn.execute("DELETE FROM notification_outbox WHERE notification_type=? AND delivered_at IS NULL",
+                             (notification_type,))
     finally:
         conn.close()
 

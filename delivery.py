@@ -107,21 +107,29 @@ class NotificationOutbox:
         finally:
             conn.close()
 
-    def insert(self, conn, text, key, entities=None):
+    def insert(self, conn, text, key, entities=None, notification_type=None):
         for index, (part, part_entities) in enumerate(chunks_with_entities(text, entities)):
             conn.execute("""INSERT OR IGNORE INTO notification_outbox
-                (event_key, chat_id, text, created_at, entities) VALUES (?, ?, ?, ?, ?)""",
+                (event_key, chat_id, text, created_at, entities, notification_type)
+                VALUES (?, ?, ?, ?, ?, ?)""",
                          (f"{key}:{index}", self.chat_id, part, time.time(),
-                          json.dumps(part_entities) if part_entities else None))
+                          json.dumps(part_entities) if part_entities else None, notification_type))
 
-    def enqueue(self, text, key, mutation=None, entities=None):
+    def enqueue(self, text, key, mutation=None, entities=None, notification_type=None):
         conn = get_connection()
         try:
             with conn:
                 if mutation:
                     if mutation(conn) is False:
                         return
-                self.insert(conn, text, key, entities)
+                if notification_type:
+                    preference = conn.execute(
+                        "SELECT enabled FROM notification_preferences WHERE notification_type=?",
+                        (notification_type,),
+                    ).fetchone()
+                    if preference and not preference[0]:
+                        return
+                self.insert(conn, text, key, entities, notification_type)
         finally:
             conn.close()
         self.wake.set()
@@ -228,7 +236,7 @@ class TicketDelivery:
                          (self.account_id, channel_id))
             return True
         self.outbox.enqueue(self._account_text(text), f"{self.account_id}:open:{channel_id}", mutation,
-                            self._account_entities(entities))
+                            self._account_entities(entities), notification_type="opened")
 
     def closed(self, channel_id, text, entities=None):
         closed_at = datetime.now(timezone.utc).isoformat()
@@ -241,7 +249,8 @@ class TicketDelivery:
             return
         self.outbox.enqueue(self._account_text(text), f"{self.account_id}:close:{channel_id}",
                             lambda conn: conn.execute("UPDATE tickets SET active=0, closed_at=COALESCE(closed_at, ?) WHERE channel_id=?",
-                                                      (closed_at, str(channel_id))), self._account_entities(entities))
+                                                      (closed_at, str(channel_id))), self._account_entities(entities),
+                            notification_type="closed")
 
     def message(self, channel_id, message_id, text, entities=None):
         if not message_id:
@@ -254,4 +263,4 @@ class TicketDelivery:
         if owner and owner[0] not in (None, self.account_id):
             return
         self.outbox.enqueue(self._account_text(text), f"{self.account_id}:message:{message_id}",
-                            entities=self._account_entities(entities))
+                            entities=self._account_entities(entities), notification_type="message")

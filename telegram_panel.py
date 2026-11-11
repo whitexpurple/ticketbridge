@@ -12,9 +12,15 @@ from telegram.ext import CommandHandler, CallbackQueryHandler, MessageHandler, f
 
 from discord_session import DiscordConnectionError, login_request
 from delivery import chunks
+from database import get_notification_preference, set_notification_preference
 
 SETUP_TTL = 300
 logger = logging.getLogger(__name__)
+NOTIFICATION_TYPES = {
+    "opened": "Opened Ticket",
+    "closed": "Closed Ticket",
+    "message": "Message",
+}
 
 
 def is_authorized(update):
@@ -62,6 +68,7 @@ async def start(update, context):
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Connect Discord", callback_data="connect")],
             [InlineKeyboardButton("Discord accounts", callback_data="accounts")],
+            [InlineKeyboardButton("Notification settings", callback_data="notifications")],
             [InlineKeyboardButton("Connection status", callback_data="status")],
             [InlineKeyboardButton("My servers", callback_data="servers")],
         ]),
@@ -176,6 +183,37 @@ async def report(update, context):
         await update.effective_message.reply_text(part)
 
 
+async def notifications(update, context):
+    if not is_authorized(update):
+        return
+    lines = ["Ticket notifications"]
+    keyboard = []
+    for key, label in NOTIFICATION_TYPES.items():
+        state = "ON" if get_notification_preference(key) else "OFF"
+        keyboard.append([InlineKeyboardButton(f"{label} · {state}", callback_data=f"notification:{key}")])
+    keyboard.append([InlineKeyboardButton("Close", callback_data="notifications:close")])
+    for key, label in NOTIFICATION_TYPES.items():
+        lines.append(f"\n{label}: {'ON' if get_notification_preference(key) else 'OFF'}")
+    await context.application.bot_data["server_lists"].show(
+        update, "".join(lines), InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def notification_detail(update, context, notification_type):
+    label = NOTIFICATION_TYPES[notification_type]
+    enabled = get_notification_preference(notification_type)
+    state = "ON" if enabled else "OFF"
+    keyboard = [[
+        InlineKeyboardButton("ON" + (" ✓" if enabled else ""),
+                             callback_data=f"notification-set:{notification_type}:on"),
+        InlineKeyboardButton("OFF" + (" ✓" if not enabled else ""),
+                             callback_data=f"notification-set:{notification_type}:off"),
+    ], [InlineKeyboardButton("Back", callback_data="notifications")]]
+    await context.application.bot_data["server_lists"].show(
+        update, f"{label} notifications are {state}.", InlineKeyboardMarkup(keyboard)
+    )
+
+
 def server_page(client, page=0):
     guilds = sorted(client.guilds_list, key=lambda guild: (
         str(guild.get("name") or "Unknown server").casefold(), str(guild.get("id", ""))))
@@ -229,7 +267,7 @@ async def servers(update, context, page=0):
     await context.application.bot_data["server_lists"].show(update, text, markup)
 
 
-def server_entries_page(entries, page, title):
+def server_entries_page(entries, page, title, callback_prefix="servers"):
     page_size = 15
     total = len(entries)
     pages = max(1, (total + page_size - 1) // page_size)
@@ -243,9 +281,9 @@ def server_entries_page(entries, page, title):
         lines.append(f"\n{index}. {name}\nID: {guild.get('id', 'Unknown')}\nAccount: {', '.join(item['accounts'])}")
     buttons = []
     if page:
-        buttons.append(InlineKeyboardButton("Previous", callback_data=f"servers:{page - 1}"))
+        buttons.append(InlineKeyboardButton("Previous", callback_data=f"{callback_prefix}:{page - 1}"))
     if page + 1 < pages:
-        buttons.append(InlineKeyboardButton("Next", callback_data=f"servers:{page + 1}"))
+        buttons.append(InlineKeyboardButton("Next", callback_data=f"{callback_prefix}:{page + 1}"))
     keyboard = [buttons] if buttons else []
     if pages > 1:
         lines.append(f"\nPage {page + 1} of {pages}")
@@ -293,6 +331,26 @@ async def button_handler(update, context):
     elif action == "accounts:close":
         message = update.effective_message
         await context.application.bot_data["server_lists"].close(message.chat_id, message.message_id)
+    elif action == "notifications:close":
+        message = update.effective_message
+        closed = await context.application.bot_data["server_lists"].close(message.chat_id, message.message_id)
+        if not closed:
+            await message.reply_text("Could not close the notification settings yet. I will retry automatically.")
+    elif action == "notifications":
+        await notifications(update, context)
+    elif action.startswith("notification-set:"):
+        _, notification_type, state = action.split(":", 2)
+        if notification_type not in NOTIFICATION_TYPES or state not in ("on", "off"):
+            await update.effective_message.reply_text("That notification setting is not recognized.")
+            return
+        set_notification_preference(notification_type, state == "on")
+        await notification_detail(update, context, notification_type)
+    elif action.startswith("notification:"):
+        notification_type = action.split(":", 1)[1]
+        if notification_type not in NOTIFICATION_TYPES:
+            await update.effective_message.reply_text("That notification type is not recognized.")
+            return
+        await notification_detail(update, context, notification_type)
     elif action.startswith("account:remove:"):
         account_id = action.rsplit(":", 1)[-1]
         record = next((item for item in context.application.bot_data["discord_session"].summaries()
@@ -331,6 +389,22 @@ async def button_handler(update, context):
         await servers(update, context, page)
     elif action == "server-picker":
         await server_account_picker(update, context)
+    elif action.startswith("server-page:"):
+        _, account_id, page_value = (action.split(":", 2) + ["0"])[:3]
+        try:
+            page = int(page_value)
+        except ValueError:
+            page = 0
+        account = next((item for item in context.application.bot_data["discord_session"].summaries()
+                        if item["id"] == account_id), None)
+        if not account:
+            await update.effective_message.reply_text("That account is no longer available.")
+            return
+        entries = [{"guild": guild, "accounts": [account["username"]]} for guild in account["guilds"]]
+        text, markup = server_entries_page(
+            entries, page, f"{account['username']} servers", f"server-page:{account_id}"
+        )
+        await context.application.bot_data["server_lists"].show(update, text, markup)
     elif action.startswith("server-account:"):
         account_id = action.split(":", 1)[1]
         account = next((item for item in context.application.bot_data["discord_session"].summaries()
@@ -339,7 +413,9 @@ async def button_handler(update, context):
             await update.effective_message.reply_text("That account is no longer available.")
             return
         entries = [{"guild": guild, "accounts": [account["username"]]} for guild in account["guilds"]]
-        text, markup = server_entries_page(entries, 0, f"{account['username']} servers")
+        text, markup = server_entries_page(
+            entries, 0, f"{account['username']} servers", f"server-page:{account_id}"
+        )
         await context.application.bot_data["server_lists"].show(update, text, markup)
     else:
         await update.effective_message.reply_text("Manual category setup is no longer needed. Use /start.")
@@ -439,7 +515,7 @@ def register_handlers(application):
     application.add_error_handler(telegram_error_handler)
     for command, handler in (("start", start), ("connect", connect), ("reconnect", reconnect),
                              ("cancel", cancel), ("status", status), ("report", report),
-                             ("servers", servers), ("accounts", accounts),
+                             ("servers", servers), ("accounts", accounts), ("notifications", notifications),
                              ("server", server_account_picker)):
         application.add_handler(CommandHandler(command, handler))
     application.add_handler(CallbackQueryHandler(button_handler))

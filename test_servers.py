@@ -74,6 +74,39 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             await button_handler(update, context)
             update.callback_query.edit_message_text.assert_not_awaited()
 
+    async def test_account_server_pagination_stays_with_selected_account(self):
+        update = self.update()
+        account_servers = [{"id": str(index), "name": f"Account Alpha {index:02d}"}
+                           for index in range(20)]
+        other_servers = [{"id": str(index + 100), "name": f"Other Account {index:02d}"}
+                         for index in range(18)]
+        session = SimpleNamespace(summaries=lambda: [
+            {"id": "alpha", "username": "Alpha", "guilds": account_servers},
+            {"id": "beta", "username": "Beta", "guilds": other_servers},
+        ])
+        context = SimpleNamespace(application=SimpleNamespace(bot_data={
+            "discord_session": session, "server_lists": self.lists,
+        }))
+        with patch.dict(os.environ, {"TELEGRAM_CHAT_ID": "42"}):
+            update.callback_query = SimpleNamespace(
+                data="server-account:alpha", answer=AsyncMock(), edit_message_text=AsyncMock()
+            )
+            await button_handler(update, context)
+            first_page = update.callback_query.edit_message_text.await_args.args[0]
+            markup = update.callback_query.edit_message_text.await_args.kwargs["reply_markup"]
+            self.assertIn("Alpha servers: 20", first_page)
+            self.assertEqual(markup.inline_keyboard[0][0].callback_data, "server-page:alpha:1")
+
+            update.callback_query = SimpleNamespace(
+                data="server-page:alpha:1", answer=AsyncMock(), edit_message_text=AsyncMock()
+            )
+            await button_handler(update, context)
+        second_page = update.callback_query.edit_message_text.await_args.args[0]
+        self.assertIn("Alpha servers: 20", second_page)
+        self.assertIn("Account Alpha 19", second_page)
+        self.assertNotIn("All Discord servers", second_page)
+        self.assertNotIn("Other Account", second_page)
+
     async def test_disconnected_empty_and_reconnecting(self):
         update = self.update()
         with patch.dict(os.environ, {"TELEGRAM_CHAT_ID": "42"}):

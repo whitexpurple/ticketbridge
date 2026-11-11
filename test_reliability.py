@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from telegram.error import NetworkError, RetryAfter
 import database
+from database import set_notification_preference
 from custom_discord import CustomDiscordClient
 from delivery import NotificationOutbox, TicketDelivery, chunks
 from discord_handler import DiscordHandler
@@ -60,6 +61,27 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(database.get_ticket(self.key))
         self.assertEqual(self.outbox.pending_count(), 1)
         self.bot.send_message.assert_not_awaited()
+
+    async def test_disabled_ticket_notifications_do_not_stop_ticket_tracking(self):
+        set_notification_preference("opened", False)
+        set_notification_preference("message", False)
+        set_notification_preference("closed", False)
+        await self.discovery.consider(self.channel)
+        self.assertIsNotNone(database.get_ticket(self.key))
+        self.assertEqual(self.outbox.pending_count(), 0)
+        await self.discovery.message_created({
+            "id": str(int(self.key) + 1), "guild_id": "10", "channel_id": self.key,
+            "author": {"id": "99", "username": "Alice"}, "content": "Still tracked",
+        })
+        await self.discovery.channel_deleted(self.channel)
+        self.assertFalse(database.get_ticket(self.key)[6])
+        self.assertEqual(self.outbox.pending_count(), 0)
+
+    async def test_turning_type_off_removes_its_queued_notifications(self):
+        self.outbox.enqueue("open", "account:open:one", notification_type="opened")
+        self.outbox.enqueue("close", "account:close:one", notification_type="closed")
+        set_notification_preference("opened", False)
+        self.assertEqual(self.query("SELECT text FROM notification_outbox ORDER BY id"), [("close",)])
 
     async def test_failed_delivery_survives_new_worker_and_deduplicates(self):
         self.outbox.enqueue("ticket notification", "open:123")
